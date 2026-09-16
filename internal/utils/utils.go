@@ -1,4 +1,5 @@
 // Copyright 2025 The A2A Authors
+// Modified by HuashiCloud in 2026 to preserve empty slice semantics during deep copies.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +22,7 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
 	"github.com/a2aproject/a2a-go/v2/log"
 )
@@ -45,6 +47,8 @@ func DeepCopy[T any](task *T) (*T, error) {
 		return nil, err
 	}
 
+	// gob 将非 nil 的空切片解码为 nil；按原值恢复形状，避免 JSON 数组退化为 null。
+	restoreEmptySlices(reflect.ValueOf(task).Elem(), reflect.ValueOf(&copy).Elem())
 	return &copy, nil
 }
 
@@ -100,4 +104,63 @@ func MustPrettyPrint(value any) {
 		panic(err.Error())
 	}
 	fmt.Println(string(raw))
+}
+
+// restoreEmptySlices 仅恢复 gob 丢失的空切片形状，保留原 nil 和 gob 的类型及深复制语义。
+func restoreEmptySlices(source, target reflect.Value) {
+	if !source.IsValid() || !target.IsValid() || source.Type() != target.Type() {
+		return
+	}
+	// 自定义 gob 编解码器拥有该类型的表示，不覆盖其有意执行的转换。
+	encoder := reflect.TypeFor[gob.GobEncoder]()
+	if source.Type().Implements(encoder) || (source.Kind() != reflect.Pointer && reflect.PointerTo(source.Type()).Implements(encoder)) {
+		return
+	}
+	switch source.Kind() {
+	case reflect.Interface:
+		if source.IsNil() || target.IsNil() {
+			return
+		}
+		value := reflect.New(target.Elem().Type()).Elem()
+		value.Set(target.Elem())
+		restoreEmptySlices(source.Elem(), value)
+		if target.CanSet() {
+			target.Set(value)
+		}
+	case reflect.Pointer:
+		if !source.IsNil() && !target.IsNil() {
+			restoreEmptySlices(source.Elem(), target.Elem())
+		}
+	case reflect.Struct:
+		for i := 0; i < source.NumField(); i++ {
+			if target.Field(i).CanSet() {
+				restoreEmptySlices(source.Field(i), target.Field(i))
+			}
+		}
+	case reflect.Map:
+		if source.IsNil() || target.IsNil() {
+			return
+		}
+		for iter := source.MapRange(); iter.Next(); {
+			previous := target.MapIndex(iter.Key())
+			if !previous.IsValid() {
+				continue
+			}
+			value := reflect.New(previous.Type()).Elem()
+			value.Set(previous)
+			restoreEmptySlices(iter.Value(), value)
+			target.SetMapIndex(iter.Key(), value)
+		}
+	case reflect.Slice:
+		if !source.IsNil() && source.Len() == 0 && target.IsNil() && target.CanSet() {
+			target.Set(reflect.MakeSlice(target.Type(), 0, 0))
+		}
+		for i := 0; i < min(source.Len(), target.Len()); i++ {
+			restoreEmptySlices(source.Index(i), target.Index(i))
+		}
+	case reflect.Array:
+		for i := 0; i < source.Len(); i++ {
+			restoreEmptySlices(source.Index(i), target.Index(i))
+		}
+	}
 }
